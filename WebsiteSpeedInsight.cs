@@ -36,9 +36,9 @@ namespace WebsiteSpeedInsight
             _wpEngineServices = wpEngineServices;
         }
 
-        // Runs once a day at 00:00 UTC. Azure NCRONTAB: {second} {minute} {hour} {day} {month} {day-of-week}
+        // Each website is measured once per week, 20 sites per run, so one execution stays short.
         [Function("WebsiteSpeedInsight")]
-        public Task Run([TimerTrigger("0 0 0 * * *")] TimerInfo myTimer)
+        public Task Run([TimerTrigger("0 0 * * * *")] TimerInfo myTimer)
         {
             Log.Information("WebsiteSpeedInsight function executed at: {Time}", DateTime.UtcNow);
             Console.WriteLine("started website speed insight function");
@@ -137,56 +137,99 @@ namespace WebsiteSpeedInsight
 
         private void Collect()
         {
+            const int batchSize = 20;
+            var websites = new List<PendingWebsite>();
             try
             {
-                int clientId;
-                string? websiteUrl;
-                string? installId;
-                string? environment;
-                int vitalId;
-                using (var connection = new SqlConnection(config["ConnectionStrings:DbConnectionString"]))
+                using var connection = new SqlConnection(config["ConnectionStrings:DbConnectionString"]);
+                connection.Open();
+                using var command = new SqlCommand("""
+                    DECLARE @today date = CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'India Standard Time' AS date);
+                    DECLARE @weekStart date = DATEADD(day, -(DATEDIFF(day, '19000101', @today) % 7), @today);
+
+                    SELECT TOP (@BatchSize) w.Id, w.PrimaryDomain, w.InstallId, w.Environment, v.Id
+                    FROM wpenginewebsitedata w
+                    LEFT JOIN WebsiteCoreWebVitals v
+                        ON v.ClientId = w.Id
+                       AND v.MonthYear = DATEFROMPARTS(YEAR(@today), MONTH(@today), 1)
+                    WHERE LOWER(LTRIM(RTRIM(w.Environment))) = 'production'
+                      AND w.PrimaryDomain IS NOT NULL
+                      AND LTRIM(RTRIM(w.PrimaryDomain)) <> ''
+                      AND (
+                            v.Id IS NULL
+                            OR CAST(
+                                (ISNULL(v.ModifiedTime, v.CreatedTime) AT TIME ZONE 'UTC')
+                                AT TIME ZONE 'India Standard Time' AS date
+                               ) < @weekStart
+                          )
+                    ORDER BY CASE WHEN v.Id IS NULL THEN 0 ELSE 1 END, ISNULL(v.ModifiedTime, v.CreatedTime), w.Id
+                    """, connection);
+                command.Parameters.AddWithValue("@BatchSize", batchSize);
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
                 {
-                    connection.Open();
-                    using var command = new SqlCommand("""
-                        SELECT TOP 1 w.Id, w.PrimaryDomain, w.InstallId, w.Environment, v.Id
-                        FROM wpenginewebsitedata w
-                        INNER JOIN WebsiteCoreWebVitals v
-                            ON v.ClientId = w.Id
-                           AND v.MonthYear = DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
-                        WHERE LOWER(LTRIM(RTRIM(w.Environment))) = 'production'
-                          AND w.PrimaryDomain IS NOT NULL
-                          AND LTRIM(RTRIM(w.PrimaryDomain)) <> ''
-                        ORDER BY ISNULL(v.ModifiedTime, v.CreatedTime), w.Id
-                        """, connection);
-                    using var reader = command.ExecuteReader();
-                    if (!reader.Read())
+                    websites.Add(new PendingWebsite
                     {
-                        Log.Information("No saved production website is waiting for a Core Web Vitals update.");
-                        return;
-                    }
-
-                    clientId = reader.GetInt32(0);
-                    websiteUrl = reader.GetString(1);
-                    installId = reader.GetString(2);
-                    environment = reader.IsDBNull(3) ? null : reader.GetString(3);
-                    vitalId = reader.GetInt32(4);
+                        ClientId = reader.GetInt32(0),
+                        WebsiteUrl = reader.GetString(1),
+                        InstallId = reader.GetString(2),
+                        Environment = reader.IsDBNull(3) ? null : reader.GetString(3),
+                        VitalId = reader.IsDBNull(4) ? null : reader.GetInt32(4)
+                    });
                 }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Error : " + e);
+                Log.Error(e.Message);
+                return;
+            }
 
-                var pageUrl = websiteUrl.Contains("://", StringComparison.OrdinalIgnoreCase)
-                    ? websiteUrl.Trim()
-                    : "https://" + websiteUrl.Trim();
-                Log.Information("Core Web Vitals for wpengine website {WebsiteId} install {InstallId} url {Url}", clientId, installId, pageUrl);
+            if (websites.Count == 0)
+            {
+                Log.Information("Every production website already has Core Web Vitals for this week.");
+                return;
+            }
 
-                var mobile = FetchPageSpeed(pageUrl, "mobile");
-                var desktop = FetchPageSpeed(pageUrl, "desktop");
-                if (mobile == null || desktop == null)
+            Log.Information("Core Web Vitals batch started for {Count} websites", websites.Count);
+            foreach (var website in websites)
+            {
+                try
                 {
-                    return;
+                    MeasureWebsite(website);
                 }
+                catch (Exception e)
+                {
+                    Console.WriteLine("Error : " + e);
+                    Log.Error(e, "Core Web Vitals failed for website {WebsiteId}", website.ClientId);
+                }
+            }
+        }
 
-                using var save = new SqlConnection(config["ConnectionStrings:DbConnectionString"]);
-                save.Open();
-                using var write = new SqlCommand("""
+        private void MeasureWebsite(PendingWebsite website)
+        {
+            var pageUrl = website.WebsiteUrl.Contains("://", StringComparison.OrdinalIgnoreCase)
+                ? website.WebsiteUrl.Trim()
+                : "https://" + website.WebsiteUrl.Trim();
+            Log.Information("Core Web Vitals for wpengine website {WebsiteId} install {InstallId} url {Url}", website.ClientId, website.InstallId, pageUrl);
+
+            var mobile = FetchPageSpeed(pageUrl, "mobile");
+            var desktop = FetchPageSpeed(pageUrl, "desktop");
+            if (mobile == null || desktop == null)
+            {
+                return;
+            }
+
+            using var save = new SqlConnection(config["ConnectionStrings:DbConnectionString"]);
+            save.Open();
+            using var write = website.VitalId == null
+                ? new SqlCommand("""
+                    INSERT INTO WebsiteCoreWebVitals
+                        (ClientId, ProjectId, MonthYear, CreatedTime, CreatedBy, FCP, LCP, CLS, TBT, MobilePerformanceScore, DesktopPerformanceScore)
+                    VALUES
+                        (@ClientId, NULL, DATEFROMPARTS(YEAR(CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'India Standard Time' AS date)), MONTH(CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'India Standard Time' AS date)), 1), GETDATE(), 'SYSTEM', @FCP, @LCP, @CLS, @TBT, @MobilePerformanceScore, @DesktopPerformanceScore)
+                    """, save)
+                : new SqlCommand("""
                     UPDATE WebsiteCoreWebVitals
                     SET FCP = @FCP,
                         LCP = @LCP,
@@ -197,44 +240,45 @@ namespace WebsiteSpeedInsight
                         ModifiedTime = GETDATE()
                     WHERE Id = @Id
                     """, save);
-                write.Parameters.AddWithValue("@Id", vitalId);
-                write.Parameters.AddWithValue("@FCP", mobile.Fcp);
-                write.Parameters.AddWithValue("@LCP", mobile.Lcp);
-                write.Parameters.AddWithValue("@CLS", mobile.Cls);
-                write.Parameters.AddWithValue("@TBT", mobile.Tbt);
-                write.Parameters.AddWithValue("@MobilePerformanceScore", (object?)mobile.PerformanceScore ?? DBNull.Value);
-                write.Parameters.AddWithValue("@DesktopPerformanceScore", (object?)desktop.PerformanceScore ?? DBNull.Value);
-                write.ExecuteNonQuery();
-                Log.Information(
-                    "WebsiteCoreWebVitals updated for wpengine website {WebsiteId}. Mobile {MobileScore} Desktop {DesktopScore}",
-                    clientId,
-                    mobile.PerformanceScore,
-                    desktop.PerformanceScore);
-
-                const decimal mobileThreshold = 0.80m;
-                const decimal desktopThreshold = 0.85m;
-                if (mobile.PerformanceScore < mobileThreshold || desktop.PerformanceScore < desktopThreshold)
-                {
-                    try
-                    {
-                        SendLowScoreEmail(pageUrl, environment, mobile, desktop, mobileThreshold, desktopThreshold);
-                    }
-                    catch (Exception mailError)
-                    {
-                        Log.Error(mailError, "Low score email failed for {Url}", pageUrl);
-                    }
-                }
-            }
-            catch (Exception e)
+            if (website.VitalId == null)
             {
-                Console.WriteLine("Error : " + e);
-                Log.Error(e.Message);
+                write.Parameters.AddWithValue("@ClientId", website.ClientId);
+            }
+            else
+            {
+                write.Parameters.AddWithValue("@Id", website.VitalId.Value);
+            }
+            write.Parameters.AddWithValue("@FCP", mobile.Fcp);
+            write.Parameters.AddWithValue("@LCP", mobile.Lcp);
+            write.Parameters.AddWithValue("@CLS", mobile.Cls);
+            write.Parameters.AddWithValue("@TBT", mobile.Tbt);
+            write.Parameters.AddWithValue("@MobilePerformanceScore", (object?)mobile.PerformanceScore ?? DBNull.Value);
+            write.Parameters.AddWithValue("@DesktopPerformanceScore", (object?)desktop.PerformanceScore ?? DBNull.Value);
+            write.ExecuteNonQuery();
+            Log.Information(
+                "WebsiteCoreWebVitals updated for wpengine website {WebsiteId}. Mobile {MobileScore} Desktop {DesktopScore}",
+                website.ClientId,
+                mobile.PerformanceScore,
+                desktop.PerformanceScore);
+
+            const decimal mobileThreshold = 0.80m;
+            const decimal desktopThreshold = 0.85m;
+            if (mobile.PerformanceScore < mobileThreshold || desktop.PerformanceScore < desktopThreshold)
+            {
+                try
+                {
+                    SendLowScoreEmail(pageUrl, website.Environment, mobile, desktop, mobileThreshold, desktopThreshold);
+                }
+                catch (Exception mailError)
+                {
+                    Log.Error(mailError, "Low score email failed for {Url}", pageUrl);
+                }
             }
         }
 
         private PageSpeedSnapshot? FetchPageSpeed(string pageUrl, string strategy)
         {
-            using var httpClient = new HttpClient();
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
             var apiUrl = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url="
                 + Uri.EscapeDataString(pageUrl)
                 + "&key=" + config["API_Key"]
@@ -355,6 +399,15 @@ namespace WebsiteSpeedInsight
             var percent = (score.Value * 100m).ToString("0.##", CultureInfo.InvariantCulture);
             var status = score.Value < threshold ? "below " + thresholdPercent : "meets " + thresholdPercent;
             return label + ": " + percent + " (" + score.Value.ToString("0.####", CultureInfo.InvariantCulture) + ") — " + status;
+        }
+
+        private sealed class PendingWebsite
+        {
+            public int ClientId { get; init; }
+            public string WebsiteUrl { get; init; } = "";
+            public string InstallId { get; init; } = "";
+            public string? Environment { get; init; }
+            public int? VitalId { get; init; }
         }
 
         private sealed class PageSpeedSnapshot
