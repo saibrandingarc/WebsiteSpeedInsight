@@ -36,7 +36,7 @@ namespace WebsiteSpeedInsight
             _wpEngineServices = wpEngineServices;
         }
 
-        // Each website is measured once per week, 20 sites per run, so one execution stays short.
+        // Each website is measured once per week, 10 sites per run, so one execution stays inside the Flex timeout.
         [Function("WebsiteSpeedInsight")]
         public Task Run([TimerTrigger("0 0 * * * *")] TimerInfo myTimer)
         {
@@ -137,7 +137,7 @@ namespace WebsiteSpeedInsight
 
         private void Collect()
         {
-            const int batchSize = 20;
+            const int batchSize = 10;
             var websites = new List<PendingWebsite>();
             try
             {

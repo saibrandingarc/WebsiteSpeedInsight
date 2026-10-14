@@ -22,16 +22,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup DotNet ${{ env.DOTNET_VERSION }} Environment
-        uses: actions/setup-dotnet@v1
+        uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
+          dotnet-version: ${{ env.DOTNET_VERSION }}.x
 
-      - name: 'Resolve Project Dependencies Using Dotnet'
+      - name: 'Publish isolated worker'
         shell: bash
         run: |
-          pushd './${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}'
-          dotnet build --configuration Release --output ./output
-          popd
+          dotnet publish WebsiteSpeedInsight.csproj --configuration Release --output ./output
       
       - name: 'Run Azure Functions Action'
         uses: Azure/functions-action@v1
