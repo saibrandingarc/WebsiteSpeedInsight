@@ -261,8 +261,8 @@ namespace WebsiteSpeedInsight
                 mobile.PerformanceScore,
                 desktop.PerformanceScore);
 
-            const decimal mobileThreshold = 0.80m;
-            const decimal desktopThreshold = 0.85m;
+            const decimal mobileThreshold = 0.85m;
+            const decimal desktopThreshold = 0.95m;
             if (mobile.PerformanceScore < mobileThreshold || desktop.PerformanceScore < desktopThreshold)
             {
                 try
@@ -360,8 +360,8 @@ namespace WebsiteSpeedInsight
             body.AppendLine("Website: " + pageUrl);
             body.AppendLine("Environment: " + (environment ?? ""));
             body.AppendLine("Month: " + month);
-            body.AppendLine("Mobile threshold: 80");
-            body.AppendLine("Desktop threshold: 85");
+            body.AppendLine("Mobile threshold: " + (mobileThreshold * 100m).ToString("0.##", CultureInfo.InvariantCulture));
+            body.AppendLine("Desktop threshold: " + (desktopThreshold * 100m).ToString("0.##", CultureInfo.InvariantCulture));
             body.AppendLine();
             body.AppendLine(ScoreLine("Mobile performance", mobile.PerformanceScore, mobileThreshold));
             body.AppendLine(ScoreLine("Desktop performance", desktop.PerformanceScore, desktopThreshold));
