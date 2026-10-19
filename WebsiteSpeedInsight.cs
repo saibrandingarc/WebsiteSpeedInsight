@@ -155,6 +155,7 @@ namespace WebsiteSpeedInsight
                     WHERE LOWER(LTRIM(RTRIM(w.Environment))) = 'production'
                       AND w.PrimaryDomain IS NOT NULL
                       AND LTRIM(RTRIM(w.PrimaryDomain)) <> ''
+                      AND LOWER(w.PrimaryDomain) NOT LIKE '%wpenginepowered%'
                       AND (
                             v.Id IS NULL
                             OR CAST(
